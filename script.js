@@ -324,6 +324,15 @@ function init() {
       dirLight.position.set(10, 20, 10);
       dirLight.castShadow = true;
       dirLight.shadow.bias = -0.001;
+      // PERFORMANZ 1: Schatten optimieren (kleinere Map, fokussierter Bereich)
+      dirLight.shadow.mapSize.width = 1024;
+      dirLight.shadow.mapSize.height = 1024;
+      dirLight.shadow.camera.near = 0.5;
+      dirLight.shadow.camera.far = 35;
+      dirLight.shadow.camera.left = -10;
+      dirLight.shadow.camera.right = 10;
+      dirLight.shadow.camera.top = 10;
+      dirLight.shadow.camera.bottom = -10;
       scene.add(dirLight);
       
       // Deutlicheres Raster (Boden) für bessere Orientierung und Kontrast
@@ -860,14 +869,18 @@ function setupOnScreenControls() {
 }
 
 // === STEUERUNG (Loop) & ANIMATION ===
-function processMovement() {
-    if (isFirstPersonActive()) return; 
-    if (!settings.controlsEnabled) return; 
+window.app.appNeedsRender = true; // PERFORMANZ 5: Render on Demand Flag
 
+function processMovement() {
+    if (isFirstPersonActive()) return false; 
+    if (!settings.controlsEnabled) return false; 
+
+    let hasMoved = false;
     const moveSpeed = 0.05 * settings.mouseSensitivity;
     const zoomSpeed = 1.02; 
 
     if (inputState.fwd || inputState.bwd || inputState.left || inputState.right) {
+        hasMoved = true;
         const forward = new THREE.Vector3();
         camera.getWorldDirection(forward);
         forward.y = 0; forward.normalize();
@@ -886,8 +899,10 @@ function processMovement() {
             controls.target.add(move);
         }
     }
-    if (inputState.zoomIn) controls.dollyIn(zoomSpeed);
-    if (inputState.zoomOut) controls.dollyOut(zoomSpeed);
+    if (inputState.zoomIn) { controls.dollyIn(zoomSpeed); hasMoved = true; }
+    if (inputState.zoomOut) { controls.dollyOut(zoomSpeed); hasMoved = true; }
+    
+    return hasMoved;
 }
 
 function animate() { 
@@ -900,16 +915,28 @@ function animate() {
             visionConeMesh.position.x = av.position.x;
             visionConeMesh.position.z = av.position.z;
             visionConeMesh.rotation.z = av.rotation.y;
+            window.app.appNeedsRender = true;
         }
     }
 
-    processMovement();
+    const moved = processMovement();
     
-    // Controls Update IMMER ausführen (für Maus-Rotation auch in FP)
-    controls.update(); 
+    // Controls Update IMMER ausführen
+    // controls.update() returnt 'true', falls die Kamera noch ausgleitet (Damping)
+    const controlsChanged = controls.update(); 
     
-    renderer.render(scene, camera); 
+    // PERFORMANZ 5: Render on Demand (Überspringt Rendern, wenn sich nichts bewegt)
+    if (window.app.appNeedsRender || moved || controlsChanged || isDragging || isFirstPersonActive()) {
+        renderer.render(scene, camera); 
+        window.app.appNeedsRender = false;
+    }
 }
+
+// Event-Listener triggern einen Render-Frame bei Interaktion
+window.addEventListener("mousemove", () => window.app.appNeedsRender = true);
+window.addEventListener("mousedown", () => window.app.appNeedsRender = true);
+window.addEventListener("mouseup", () => window.app.appNeedsRender = true);
+window.addEventListener("keydown", () => window.app.appNeedsRender = true);
 
 // Dummy Functions für Kompatibilität mit HTML Aufrufen
 window.app.moveCamera = function(x, z) {}; 
@@ -1101,7 +1128,7 @@ window.app.undo = function() {
     const hadAvatar = movableObjects.some(o => o.userData.isAvatar);
     if(hadAvatar) app.exitSimulationMode();
 
-    movableObjects.forEach(obj => { scene.remove(obj); obj.traverse(c => { if(c.geometry) c.geometry.dispose(); }); });
+    movableObjects.forEach(obj => window.app.disposeObject(obj));
     movableObjects = [];
     interactionMeshes = [];
     selectedObjects = [];
@@ -1161,18 +1188,27 @@ window.app.showColorPopup = function(obj) {
     const popup = document.getElementById('color-correction-popup');
     if(!popup) return;
 
-    // Loop, der das HTML-Popup über dem 3D-Stuhl schweben lässt
-    const updatePopupPos = () => {
-        if(popup.style.display === 'none') return;
-        const pos = obj.position.clone();
-        pos.y += 1.3; // Höhe über dem Stuhl
-        pos.project(camera);
-        const x = (pos.x * 0.5 + 0.5) * window.innerWidth;
-        const y = (pos.y * -0.5 + 0.5) * window.innerHeight;
-        popup.style.left = x + 'px';
-        popup.style.top = y + 'px';
-        requestAnimationFrame(updatePopupPos);
-    };
+    // WICHTIG: Stoppt alte Animations-Schleifen, bevor eine neue gestartet wird!
+        if (window.app.colorPopupAnimId) cancelAnimationFrame(window.app.colorPopupAnimId);
+
+        // Loop, der das HTML-Popup über dem 3D-Stuhl schweben lässt
+        const updatePopupPos = () => {
+            // Schleife sofort beenden, wenn das Popup zu ist ODER der Stuhl gelöscht wurde
+            if(popup.style.display === 'none' || !obj.parent) {
+                popup.style.display = 'none';
+                return;
+            }
+            const pos = obj.position.clone();
+            pos.y += 1.3; // Höhe über dem Stuhl
+            pos.project(camera);
+            const x = (pos.x * 0.5 + 0.5) * window.innerWidth;
+            const y = (pos.y * -0.5 + 0.5) * window.innerHeight;
+            popup.style.left = x + 'px';
+            popup.style.top = y + 'px';
+            
+            // ID speichern, um sie beim nächsten Mal abbrechen zu können
+            window.app.colorPopupAnimId = requestAnimationFrame(updatePopupPos);
+        };
 
     // Die Farben zur Auswahl (inklusive "Fallen")
     const colors = [
@@ -1273,11 +1309,28 @@ window.app.applyChairColor = function(obj, hexColor) {
     });
 };
 
+// PERFORMANZ 4: Saubere Müllabfuhr für VRAM
+window.app.disposeObject = function(obj) {
+    if (!obj) return;
+    obj.traverse(c => {
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) {
+            const disposeMat = (m) => {
+                m.dispose();
+                if(m.map) m.map.dispose();
+            };
+            if (Array.isArray(c.material)) c.material.forEach(disposeMat);
+            else disposeMat(c.material);
+        }
+    });
+    if (obj.parent) obj.parent.remove(obj);
+};
+
 window.app.clearRoom = function(doSave=true) { 
     if(doSave) saveHistory(); 
     const hadAvatar = movableObjects.some(o => o.userData.isAvatar);
     
-    movableObjects.forEach(obj => { scene.remove(obj); obj.traverse(c => { if(c.geometry) c.geometry.dispose(); }); }); 
+    movableObjects.forEach(obj => window.app.disposeObject(obj)); 
     movableObjects = []; 
     interactionMeshes = []; 
     deselectObject(); 
@@ -1300,11 +1353,10 @@ window.app.deleteSelection = function() {
         let avatarDeleted = false;
         selectedObjects.forEach(obj => {
             if(obj.userData.isAvatar) avatarDeleted = true;
-            scene.remove(obj); 
             movableObjects = movableObjects.filter(o => o !== obj); 
             const hitbox = obj.children.find(c => c.userData.root === obj); 
             if(hitbox) interactionMeshes = interactionMeshes.filter(m => m !== hitbox); 
-            obj.traverse(c => { if(c.geometry) c.geometry.dispose(); });
+            window.app.disposeObject(obj);
         });
         deselectObject(); 
         updateSeatCount(); 
@@ -1942,25 +1994,23 @@ function getOrLoadFurniture(key) {
             model.scale.set(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
             disableCullingRecursively(model);
             
-            // PBR Maps entfernen und absolut matte Basisfarbe erzwingen
+            // PERFORMANZ 2: Teure Materialien in günstige Lambert-Materialien umwandeln
             model.traverse((child) => {
                 if (child.isMesh && child.material) {
-                    const stripPBR = (mat) => {
-                        mat.roughness = 1.0;
-                        mat.metalness = 0.0;
-                        mat.normalMap = null;
-                        mat.roughnessMap = null;
-                        mat.metalnessMap = null;
-                        mat.aoMap = null;
-                        mat.emissiveMap = null;
-                        mat.envMap = null;
-                        mat.needsUpdate = true;
+                    const convertMat = (mat) => {
+                        const newMat = new THREE.MeshLambertMaterial({
+                            color: mat.color,
+                            map: mat.map,
+                            side: THREE.DoubleSide
+                        });
+                        mat.dispose(); // Altes, teures Material aus VRAM löschen
+                        return newMat;
                     };
                     
                     if (Array.isArray(child.material)) {
-                        child.material.forEach(stripPBR);
+                        child.material = child.material.map(convertMat);
                     } else {
-                        stripPBR(child.material);
+                        child.material = convertMat(child.material);
                     }
                 }
             });
@@ -2023,8 +2073,7 @@ window.app.switchRoom = async function(filename) {
   
   // Clean up old room
   if (currentRoomMesh) {
-      scene.remove(currentRoomMesh);
-      currentRoomMesh.traverse(o => { if(o.geometry) o.geometry.dispose(); });
+      window.app.disposeObject(currentRoomMesh);
       currentRoomMesh = null;
   }
   
@@ -2136,7 +2185,14 @@ function createFurnitureInstance(typeId, x, z, rotY) {
     }
     
     const wrapper = new THREE.Group();
-    visual.traverse(c => { if(c.isMesh && c.material) { c.material.depthWrite = true; c.material.transparent = false; }});
+    visual.traverse(c => { 
+        if(c.isMesh) { 
+            // PERFORMANZ 3: Nur relevante Objekte werfen Schatten
+            if(!info.noShadow && !info.isWallItem) c.castShadow = true;
+            c.receiveShadow = true;
+            if (c.material) { c.material.depthWrite = true; c.material.transparent = false; }
+        }
+    });
     wrapper.add(visual);
 
     const hW = info.dims ? info.dims.x : 1.0;
@@ -2286,6 +2342,11 @@ function deselectObject() {
     selectedRoot = null; selectedObjects = []; selectionBox.visible = false; 
     document.getElementById("context-menu").classList.remove("visible"); 
     document.getElementById('selection-details').style.display = 'none'; 
+    
+    // Verhindert, dass das schwebende Popup beim Abwählen offen bleibt
+    const colorPopup = document.getElementById('color-correction-popup');
+    if (colorPopup) colorPopup.style.display = 'none';
+    
     document.querySelectorAll('.object-list-item').forEach(el => el.classList.remove('selected')); 
 }
 
